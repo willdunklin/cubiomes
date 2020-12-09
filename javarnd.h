@@ -111,4 +111,5 @@ static inline int64_t invSeed48(int64_t nseed)
 }
 
 
+
 #endif /* JAVARND_H_ */

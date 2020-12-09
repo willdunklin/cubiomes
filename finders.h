@@ -25,7 +25,7 @@ extern "C"
 {
 #endif
 
-#define MASK48 ((1LL << 48) - 1)
+#define SEED_BASE_MAX (1LL << 48)
 #define PI 3.141592653589793
 
 #define LARGE_STRUCT 1
@@ -46,12 +46,46 @@ enum StructureType
     Outpost,
     Ruined_Portal,
     Treasure,
+    Bastion,
+    Fortress,
 };
 
 enum // village house types prior to 1.14
 {
     HouseSmall, Church, Library, WoodHut, Butcher, FarmLarge, FarmSmall,
     Blacksmith, HouseLarge, HOUSE_NUM
+};
+
+
+// only the very best constellations
+static const int64_t lowerBaseBitsIdeal[] =
+{
+        0x43f18,0xc751a,0xf520a,
+};
+
+// for the classic quad-structure constellations
+static const int64_t lowerBaseBitsClassic[] =
+{
+        0x43f18,0x79a0a,0xc751a,0xf520a,
+};
+
+// for any valid quad-structure constellation with a structure size:
+// (7+1,7+43+1,9+1) which corresponds to a fall-damage based quad-witch-farm,
+// but may require a perfect player position
+static const int64_t lowerBaseBitsHutNormal[] =
+{
+        0x43f18,0x65118,0x75618,0x79a0a, 0x89718,0x9371a,0xa5a08,0xb5e18,
+        0xc751a,0xf520a,
+};
+
+// for any valid quad-structure constellation with a structure size:
+// (7+1,7+1,9+1) which corresponds to quad-witch-farms without drop chute
+static const int64_t lowerBaseBitsHutBarely[] =
+{
+        0x1272d,0x17908,0x367b9,0x43f18, 0x487c9,0x487ce,0x50aa7,0x647b5,
+        0x65118,0x75618,0x79a0a,0x89718, 0x9371a,0x967ec,0xa3d0a,0xa5918,
+        0xa591d,0xa5a08,0xb5e18,0xc6749, 0xc6d9a,0xc751a,0xd7108,0xd717a,
+        0xe2739,0xe9918,0xee1c4,0xf520a,
 };
 
 
@@ -88,6 +122,9 @@ static const StructureConfig SHIPWRECK_CONFIG      = {165745295, 24, 20, Shipwre
 static const StructureConfig MONUMENT_CONFIG       = { 10387313, 32, 27, Monument, LARGE_STRUCT};
 static const StructureConfig MANSION_CONFIG        = { 10387319, 80, 60, Mansion, LARGE_STRUCT};
 static const StructureConfig RUINED_PORTAL_CONFIG  = { 34222645, 40, 25, Ruined_Portal, 0}; // overworld variant
+
+static const StructureConfig BASTION_CONFIG  = { 30084232, 27, 23, Bastion, 0};
+static const StructureConfig FORTRESS_CONFIG  = { 30084232, 27, 23, Fortress, 0};
 
 // structures that check each chunk individually
 static const StructureConfig TREASURE_CONFIG       = { 10387320,  1,  0, Treasure, CHUNK_STRUCT};
@@ -129,19 +166,6 @@ STRUCT(BiomeFilter)
     int specialCnt; // number of special temperature categories required
 };
 
-STRUCT(StrongholdIter)
-{
-    Pos pos;        // accurate location of current stronghold
-    Pos nextapprox; // approxmimate location (+/-112 blocks) of next stronghold
-    int index;      // stronghold index counter
-    int ringnum;    // ring number for index
-    int ringmax;    // max index within ring
-    int ringidx;    // index within ring
-    double angle;   // next angle within ring
-    double dist;    // next distance from origin (in chunks)
-    int64_t rnds;   // random number seed (48 bit)
-    int mc;         // minecraft version
-};
 
 /******************************** SEED FINDING *********************************
  *
@@ -194,37 +218,6 @@ STRUCT(StrongholdIter)
  */
 
 
-// lower 20 bits, only the very best constellations
-// (the structure salt has to be subtracted before use)
-static const int64_t low20QuadIdeal[] =
-{
-        0x43f18,0xc751a,0xf520a,
-};
-
-// lower 20 bits, the classic quad-structure constellations
-static const int64_t low20QuadClassic[] =
-{
-        0x43f18,0x79a0a,0xc751a,0xf520a,
-};
-
-// for any valid quad-structure constellation with a structure size:
-// (7+1,7+43+1,9+1) which corresponds to a fall-damage based quad-witch-farm,
-// but may require a perfect player position
-static const int64_t low20QuadHutNormal[] =
-{
-        0x43f18,0x65118,0x75618,0x79a0a, 0x89718,0x9371a,0xa5a08,0xb5e18,
-        0xc751a,0xf520a,
-};
-
-// for any valid quad-structure constellation with a structure size:
-// (7+1,7+1,9+1) which corresponds to quad-witch-farms without drop chute
-static const int64_t low20QuadHutBarely[] =
-{
-        0x1272d,0x17908,0x367b9,0x43f18, 0x487c9,0x487ce,0x50aa7,0x647b5,
-        0x65118,0x75618,0x79a0a,0x89718, 0x9371a,0x967ec,0xa3d0a,0xa5918,
-        0xa591d,0xa5a08,0xb5e18,0xc6749, 0xc6d9a,0xc751a,0xd7108,0xd717a,
-        0xe2739,0xe9918,0xee1c4,0xf520a,
-};
 
 //==============================================================================
 // Moving Structures
@@ -364,38 +357,23 @@ static inline __attribute__((always_inline, const))
 float isQuadBaseLarge (const StructureConfig sconf, int64_t seed,
         int ax, int ay, int az, int radius);
 
+// Defines how the search should limit the lower bits of the seed bases.
+// Conveniently this also provides a way of specifying a quality category.
+enum LowBitSet
+{
+    LBIT_ALL,           // all bit configurations
+    LBIT_HUT_BARELY,    // any constellation for huts within 128 blocks
+    LBIT_HUT_NORMAL,    // sufficiently close for standard farm designs
+    LBIT_CLASSIC,       // only classic constellations
+    LBIT_IDEAL,         // only the very best constellations that exist
+};
 
-/* Starts a multi-threaded search through all 48-bit seeds. Since this can
- * potentially be a lengthy calculation, results can be written to temporary
- * files immediately, in order to save progress in case of interruption. Seeds
- * are tested using the function 'check' which takes a 48-bit seed and a custom
- * 'data' argument. The output can be a dynamically allocated seed buffer
- * and/or a destination file [which can be loaded using loadSavedSeeds()].
- * Optionally, only a subset of the lower 20 bits are searched.
- *
- * @seedbuf     output seed buffer (nullable for file only)
- * @buflen      length of output buffer (nullable)
- * @path        output file path (nullable, also toggles temporary files)
- * @threads     number of threads to use
- * @lowBits     lower bit subset (nullable)
- * @lowBitCnt   length of lower bit subset
- * @lowBitN     number of bits in the subset values
- * @check       the testing function, should return non-zero for desired seeds
- * @data        custon data argument passed to 'check'
- *
- * Returns zero upon success.
+/* Starts a multi-threaded search for quad-bases, given a maximum block radius
+ * for the enclosing sphere. The result is saved in a file of path 'fnam'.
  */
-int searchAll48(
-        int64_t **          seedbuf,
-        int64_t *           buflen,
-        const char *        path,
-        int                 threads,
-        const int64_t *     lowBits,
-        int                 lowBitCnt,
-        int                 lowBitN,
-        int (*check)(int64_t s48, void *data),
-        void *              data
-        );
+void search4QuadBases(const char *fnam, int threads,
+        const StructureConfig structureConfig, int radius, int lbitset);
+
 
 int countBlocksInSpawnRange(Pos p[4], int ax, int ay, int az, Pos *afk);
 
@@ -480,30 +458,19 @@ int getBiomeRadius(
 // Finding Strongholds and Spawn
 //==============================================================================
 
-/* Finds the approximate location of the first stronghold (+/-112 blocks),
- * which can be determined from the lower 48 bits of the world seed without
- * biome checks. If 'sh' is not NULL, it will be initialized for iteration
- * using nextStronghold() to get the accurate stronghold locations, as well as
- * the subsequent approximate stronghold positions.
+/* The chunk locations of the 3 closest strongholds, from the inner ring, can
+ * be approximated without going through the full biome check. However, the 
+ * accurate positions as well as the locations of the strongholds in the outer
+ * rings depend on a pseudo-random-number which requires the full biome check 
+ * for all strongholds before them.
  *
- * @sh      : stronghold iterator to be initialized (nullable)
- * @mc      : minecraft version (changes in 1.7, 1.9, 1.13)
- * @s48     : world seed (only 48-bit are relevant)
- *
- * Returns the approximate block position of the first stronghold.
+ * Up to MC_1_8 this covers the approximate location for all strongholds as 
+ * there is only one ring.
+ * 
+ * Note that this function requires only the lower 48-bits of the seed, and the
+ * accuracy is within +/-112 blocks.
  */
-Pos initFirstStronghold(StrongholdIter *sh, int mc, int64_t s48);
-
-/* Performs the biome checks for the stronghold iterator and finds its accurate
- * location, as well as the approximate location of the next stronghold.
- *
- * @sh      : stronghold iteration state, holding position info
- * @g       : generator layer stack [world seed should be applied before call!]
- * @cache   : biome buffer, set to NULL for temporary allocation
- *
- * Returns the number of further strongholds after this one.
- */
-int nextStronghold(StrongholdIter *sh, const LayerStack *g, int *cache);
+void approxInnerStrongholdRing(Pos p[3], int mcversion, int64_t s48);
 
 /* Finds the block positions of the strongholds in the world. Note that the
  * number of strongholds was increased from 3 to 128 in MC 1.9.

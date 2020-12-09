@@ -5,18 +5,6 @@
 #include <stdlib.h>
 #include <math.h>
 
-#include <sys/types.h>
-#include <sys/stat.h>
-
-#if defined(_WIN32)
-#include <direct.h>
-#define IS_DIR_SEP(C) ((C) == '/' || (C) == '\\')
-#define stat _stat
-#define mkdir(P,X) _mkdir(P)
-#define S_IFDIR _S_IFDIR
-#else
-#define IS_DIR_SEP(C) ((C) == '/')
-#endif
 
 //==============================================================================
 // Globals
@@ -38,7 +26,10 @@ int64_t *loadSavedSeeds(const char *fnam, int64_t *scnt)
     int64_t *baseSeeds;
 
     if (fp == NULL)
+    {
+        perror("ERR loadSavedSeeds: ");
         return NULL;
+    }
 
     *scnt = 0;
 
@@ -47,9 +38,6 @@ int64_t *loadSavedSeeds(const char *fnam, int64_t *scnt)
         if (fscanf(fp, "%" PRId64, &seed) == 1) (*scnt)++;
         else while (!feof(fp) && fgetc(fp) != '\n');
     }
-
-    if (*scnt == 0)
-        return NULL;
 
     baseSeeds = (int64_t*) calloc(*scnt, sizeof(*baseSeeds));
 
@@ -83,7 +71,7 @@ static int testOutpostPos(int64_t s, int cx, int cz)
 
 Pos getStructurePos(StructureConfig config, int64_t seed, int regX, int regZ, int *valid)
 {
-    Pos pos = {0,0};
+    Pos pos;
     if (valid) *valid = 0;
 
     if (config.properties == 0)
@@ -226,161 +214,138 @@ int countBlocksInSpawnRange(Pos p[4], int ax, int ay, int az, Pos *afk)
 }
 
 
-#define MAX_PATHLEN 4096
-
-STRUCT(linked_seeds_t)
+STRUCT(quad_threadinfo_t)
 {
-    int64_t seeds[100];
-    size_t len;
-    linked_seeds_t *next;
-};
-
-STRUCT(threadinfo_t)
-{
-    // seed range
     int64_t start, end;
-    const int64_t *lowBits;
-    int lowBitCnt;
-    int lowBitN;
-
-    // testing function
-    int (*check)(int64_t, void*);
-    void *data;
-
-    // output
-    char path[MAX_PATHLEN];
-    FILE *fp;
-    linked_seeds_t ls;
+    StructureConfig sconf;
+    int threadID;
+    int radius;
+    int lbitset;
+    const char *fnam;
 };
-
-
-static int mkdirp(char *path)
-{
-    int err = 0, len = strlen(path);
-    char *p = path;
-
-#if defined(_WIN32)
-    if (p[1] == ':') p += 2;
-#endif
-    while (IS_DIR_SEP(*p)) p++;
-
-    while (!err && p < path+len)
-    {
-        char *q = p;
-        while (*q && !IS_DIR_SEP(*q))
-            q++;
-
-        if (p != path) p[-1] = '/';
-        *q = 0;
-
-        struct stat st;
-        if (stat(path, &st) == -1)
-            err = mkdir(path, 0773);
-        else if (!(st.st_mode & S_IFDIR))
-            err = 1;
-
-        p = q+1;
-    }
-
-    return err;
-}
-
 
 #ifdef USE_PTHREAD
-static void *searchAll48Thread(void *data)
+static void *search4QuadBasesThread(void *data)
 #else
-static DWORD WINAPI searchAll48Thread(LPVOID data)
+static DWORD WINAPI search4QuadBasesThread(LPVOID data)
 #endif
 {
-// TODO TEST:
-// lower bits with various ranges
+    quad_threadinfo_t info = *(quad_threadinfo_t*)data;
 
-    threadinfo_t *info = (threadinfo_t*)data;
+    const int64_t start       = info.start;
+    const int64_t end         = info.end;
+    const int64_t salt        = info.sconf.salt;
 
-    int64_t seed = info->start;
-    int64_t end = info->end;
-    linked_seeds_t *lp = &info->ls;
-    lp->len = 0;
-    lp->next = NULL;
+    int64_t seed;
 
-    if (info->lowBits)
+    int64_t *lowerBits;
+    int lowerBitsCnt;
+    int lowerBitsIdx = 0;
+    int i;
+
+    lowerBits = (int64_t *) malloc(0x100000 * sizeof(int64_t));
+
+    switch (info.lbitset)
     {
-        int64_t hstep = 1LL << info->lowBitN;
-        int64_t hmask = ~(hstep - 1);
-        int64_t mid;
-        int idx;
+    case LBIT_IDEAL:
+        lowerBitsCnt = sizeof(lowerBaseBitsIdeal) / sizeof(int64_t);
+        for (i = 0; i < lowerBitsCnt; i++)
+            lowerBits[i] = (lowerBaseBitsIdeal[i] - salt) & 0xfffff;
+        break;
 
-        mid = info->start & hmask;
-        for (idx = 0; (seed = mid | info->lowBits[idx]) < info->start; idx++);
+    case LBIT_CLASSIC:
+        lowerBitsCnt = sizeof(lowerBaseBitsClassic) / sizeof(int64_t);
+        for (i = 0; i < lowerBitsCnt; i++)
+            lowerBits[i] = (lowerBaseBitsClassic[i] - salt) & 0xfffff;
+        break;
 
-        while (seed <= end)
+    case LBIT_HUT_NORMAL:
+        lowerBitsCnt = sizeof(lowerBaseBitsHutNormal) / sizeof(int64_t);
+        for (i = 0; i < lowerBitsCnt; i++)
+            lowerBits[i] = (lowerBaseBitsHutNormal[i] - salt) & 0xfffff;
+        break;
+
+    case LBIT_HUT_BARELY:
+        lowerBitsCnt = sizeof(lowerBaseBitsHutBarely) / sizeof(int64_t);
+        for (i = 0; i < lowerBitsCnt; i++)
+            lowerBits[i] = (lowerBaseBitsHutBarely[i] - salt) & 0xfffff;
+        break;
+
+    default:
+        lowerBitsCnt = 0x100000;
+        for (i = 0; i < lowerBitsCnt; i++) lowerBits[i] = i;
+        break;
+    }
+
+    char fnam[256];
+    sprintf(fnam, "%s.part%d", info.fnam, info.threadID);
+
+    FILE *fp = fopen(fnam, "a+");
+    if (fp == NULL)
+    {
+        fprintf(stderr, "Could not open \"%s\" for writing.\n", fnam);
+        free(lowerBits);
+        exit(-1);
+    }
+
+    seed = start;
+
+    // Check the last entry in the file and use it as a starting point if it
+    // exists. (I.e. loading the saved progress.)
+    int c, nnl = 0;
+    char buf[32];
+    for (i = 1; i < 32; i++)
+    {
+        if (fseek(fp, -i, SEEK_END)) break;
+        c = fgetc(fp);
+        if (c <= 0 || (nnl && c == '\n')) break;
+        nnl |= (c != '\n');
+    }
+
+    if (i < 32 && !fseek(fp, 1-i, SEEK_END) && fread(buf, i-1, 1, fp) > 0)
+    {
+        if (sscanf(buf, "%" PRId64, &seed) == 1)
         {
-            if U(info->check(seed, info->data))
-            {
-                if (info->fp)
-                {
-                    fprintf(info->fp, "%" PRId64"\n", seed);
-                    fflush(info->fp);
-                }
-                else
-                {
-                    lp->seeds[lp->len] = seed;
-                    lp->len++;
-                    if (lp->len >= sizeof(lp->seeds)/sizeof(int64_t))
-                    {
-                        linked_seeds_t *n =
-                            (linked_seeds_t*) malloc(sizeof(linked_seeds_t));
-                        if (n == NULL)
-                            exit(1);
-                        lp->next = n;
-                        lp = n;
-                        lp->len = 0;
-                        lp->next = NULL;
-                    }
-                }
-            }
+            while (lowerBits[lowerBitsIdx] <= (seed & 0xfffff))
+                lowerBitsIdx++;
 
-            idx++;
-            if (idx >= info->lowBitCnt)
-            {
-                idx = 0;
-                mid += hstep;
-            }
+            seed = (seed & 0x0000fffffff00000) + lowerBits[lowerBitsIdx];
 
-            seed = mid | info->lowBits[idx];
+            printf("Thread %d starting from: %" PRId64"\n", info.threadID, seed);
+        }
+        else
+        {
+            seed = start;
         }
     }
-    else
+
+
+    fseek(fp, 0, SEEK_END);
+
+    while (seed < end)
     {
-        while (seed <= end)
+        float r = isQuadBase(info.sconf, seed, info.radius);
+        if (r)
         {
-            if U(info->check(seed, info->data))
-            {
-                if (info->fp)
-                {
-                    fprintf(info->fp, "%" PRId64"\n", seed);
-                    fflush(info->fp);
-                }
-                else
-                {
-                    lp->seeds[lp->len] = seed;
-                    lp->len++;
-                    if (lp->len >= sizeof(lp->seeds)/sizeof(int64_t))
-                    {
-                        linked_seeds_t *n =
-                            (linked_seeds_t*) malloc(sizeof(linked_seeds_t));
-                        if (n == NULL)
-                            exit(1);
-                        lp->next = n;
-                        lp = n;
-                        lp->len = 0;
-                        lp->next = NULL;
-                    }
-                }
-            }
-            seed++;
+            fprintf(fp, "%" PRId64"\n", seed);
+            fflush(fp);
+            //FILE *ftmp = fopen("./seeds/hex", "a");
+            //fprintf(ftmp, "0x%05lx %.6f\n", (seed + salt) & 0xfffff, r);
+            //fflush(ftmp);
+            //fclose(ftmp);
         }
+
+        lowerBitsIdx++;
+        if (lowerBitsIdx >= lowerBitsCnt)
+        {
+            lowerBitsIdx = 0;
+            seed += 0x100000;
+        }
+        seed = (seed & 0x0000fffffff00000) + lowerBits[lowerBitsIdx];
     }
+
+    fclose(fp);
+    free(lowerBits);
 
 #ifdef USE_PTHREAD
     pthread_exit(NULL);
@@ -389,207 +354,91 @@ static DWORD WINAPI searchAll48Thread(LPVOID data)
 }
 
 
-int searchAll48(
-        int64_t **          seedbuf,
-        int64_t *           buflen,
-        const char *        path,
-        int                 threads,
-        const int64_t *     lowBits,
-        int                 lowBitCnt,
-        int                 lowBitN,
-        int (*check)(int64_t s48, void *data),
-        void *              data
-        )
+void search4QuadBases(const char *fnam, int threads,
+        const StructureConfig structureConfig, int radius, int lbitset)
 {
-    threadinfo_t *info = (threadinfo_t*) malloc(threads* sizeof(*info));
-    thread_id_t *tids = (thread_id_t*) malloc(threads* sizeof(*tids));
-    int i, t;
-    int err = 0;
+    thread_id_t threadID[threads];
+    quad_threadinfo_t info[threads];
+    int64_t t;
 
-    if (path)
-    {
-        size_t pathlen = strlen(path);
-        char dpath[MAX_PATHLEN];
-
-        // split path into directory and file and create missing directories
-        if (pathlen + 8 >= sizeof(dpath))
-            goto L_ERR;
-        strcpy(dpath, path);
-
-        for (i = pathlen-1; i >= 0; i--)
-        {
-            if (IS_DIR_SEP(dpath[i]))
-            {
-                dpath[i] = 0;
-                if (mkdirp(dpath))
-                    goto L_ERR;
-                break;
-            }
-        }
-    }
-    else if (seedbuf == NULL || buflen == NULL)
-    {
-        // no file and no buffer return: no output possible
-        goto L_ERR;
-    }
-
-    // prepare the thread info and load progress if present
     for (t = 0; t < threads; t++)
     {
-        info[t].start = (t * (MASK48+1) / threads);
-        info[t].end = ((t+1) * (MASK48+1) / threads - 1);
-        info[t].lowBits = lowBits;
-        info[t].lowBitCnt = lowBitCnt;
-        info[t].lowBitN = lowBitN;
-        info[t].check = check;
-        info[t].data = data;
-
-        if (path)
-        {
-            // progress file of this thread
-            snprintf(info[t].path, sizeof(info[t].path), "%s.part%d", path, t);
-            FILE *fp = fopen(info[t].path, "a+");
-            if (fp == NULL)
-                goto L_ERR;
-
-            int c, nnl = 0;
-            char buf[32];
-
-            // find the last newline
-            for (i = 1; i < 32; i++)
-            {
-                if (fseek(fp, -i, SEEK_END)) break;
-                c = fgetc(fp);
-                if (c <= 0 || (nnl && c == '\n')) break;
-                nnl |= (c != '\n');
-            }
-
-            if (i < 32 && !fseek(fp, 1-i, SEEK_END) && fread(buf, i-1, 1, fp) > 0)
-            {
-                // read the last entry, and replace the start seed accordingly
-                int64_t lentry;
-                if (sscanf(buf, "%" PRId64, &lentry) == 1)
-                {
-                    info[t].start = lentry;
-                    printf("Continuing thread %d at seed %" PRId64 "\n",
-                        t, lentry);
-                }
-            }
-
-            fseek(fp, 0, SEEK_END);
-            info[t].fp = fp;
-        }
-        else
-        {
-            info[t].path[0] = 0;
-            info[t].fp = NULL;
-        }
+        info[t].threadID = t;
+        info[t].start = (t * SEED_BASE_MAX / threads) & 0x0000fffffff00000;
+        info[t].end = ((info[t].start + (SEED_BASE_MAX-1) / threads) & 0x0000fffffff00000) + 1;
+        info[t].fnam = fnam;
+        info[t].radius = radius;
+        info[t].lbitset = lbitset;
+        info[t].sconf = structureConfig;
     }
 
 
-    // run the threads
 #ifdef USE_PTHREAD
 
     for (t = 0; t < threads; t++)
     {
-        pthread_create(&tids[t], NULL, searchAll48Thread, (void*)&info[t]);
+        pthread_create(&threadID[t], NULL, search4QuadBasesThread, (void*)&info[t]);
     }
 
     for (t = 0; t < threads; t++)
     {
-        pthread_join(tids[t], NULL);
+        pthread_join(threadID[t], NULL);
     }
 
 #else
 
     for (t = 0; t < threads; t++)
     {
-        tids[t] = CreateThread(NULL, 0, searchAll48Thread,
-            (LPVOID)&info[t], 0, NULL);
+        threadID[t] = CreateThread(NULL, 0, search4QuadBasesThread, (LPVOID)&info[t], 0, NULL);
     }
 
-    WaitForMultipleObjects(threads, tids, TRUE, INFINITE);
+    WaitForMultipleObjects(threads, threadID, TRUE, INFINITE);
 
 #endif
 
-    if (path)
-    {
-        // merge partial files
-        FILE *fp = fopen(path, "w");
-        if (fp == NULL)
-            goto L_ERR;
 
-        for (t = 0; t < threads; t++)
-        {
-            rewind(info[t].fp);
 
-            char buffer[4097];
-            size_t n;
-            while ((n = fread(buffer, sizeof(char), 4096, info[t].fp)))
-            {
-                if (!fwrite(buffer, sizeof(char), n, fp))
-                {
-                    fclose(fp);
-                    goto L_ERR;
-                }
-            }
+    // merge thread parts
 
-            fclose(info[t].fp);
-            remove(info[t].path);
-        }
-
-        fclose(fp);
-
-        if (seedbuf && buflen)
-        {
-            *seedbuf = loadSavedSeeds(path, buflen);
-        }
+    char fnamThread[256];
+    char buffer[4097];
+    FILE *fp = fopen(fnam, "w");
+    if (fp == NULL) {
+        fprintf(stderr, "Could not open \"%s\" for writing.\n", fnam);
+        exit(-1);
     }
-    else
+    FILE *fpart;
+    int n;
+
+    for (t = 0; t < threads; t++)
     {
-        // merge linked seed buffers
-        *buflen = 0;
+        sprintf(fnamThread, "%s.part%d", info[t].fnam, info[t].threadID);
 
-        for (t = 0; t < threads; t++)
+        fpart = fopen(fnamThread, "r");
+
+        if (fpart == NULL)
         {
-            linked_seeds_t *lp = &info[t].ls;
-            do
-            {
-                *buflen += lp->len;
-                lp = lp->next;
-            }
-            while (lp);
+            perror("ERR search4QuadBases: ");
+            break;
         }
 
-        *seedbuf = (int64_t*) malloc((*buflen) * sizeof(int64_t));
-        if (*seedbuf == NULL)
-            exit(1);
-
-        i = 0;
-        for (t = 0; t < threads; t++)
+        while ((n = fread(buffer, sizeof(char), 4096, fpart)))
         {
-            linked_seeds_t *lp = &info[t].ls;
-            do
+            if (!fwrite(buffer, sizeof(char), n, fp))
             {
-                memcpy(*seedbuf + i, lp->seeds, lp->len * sizeof(int64_t));
-                i += lp->len;
-                linked_seeds_t *tmp = lp;
-                lp = lp->next;
-                if (tmp != &info[t].ls)
-                    free(tmp);
+                perror("ERR search4QuadBases: ");
+                fclose(fp);
+                fclose(fpart);
+                return;
             }
-            while (lp);
         }
+
+        fclose(fpart);
+
+        remove(fnamThread);
     }
 
-    if (0)
-L_ERR:
-        err = 1;
-
-    free(tids);
-    free(info);
-
-    return err;
+    fclose(fp);
 }
 
 
@@ -780,6 +629,61 @@ int getBiomeRadius(
 //==============================================================================
 
 
+void approxInnerStrongholdRing(Pos p[3], int mcversion, int64_t s48)
+{
+    int64_t rnds = s48;
+    setSeed(&rnds);
+
+    double angle = 2.0 * PI * nextDouble(&rnds);
+    double acos = cos(angle);
+    double asin = sin(angle);
+    double tmp, distance;
+
+    const double r120c = cos(2.0 * PI / 3);
+    const double r120s = sin(2.0 * PI / 3);
+
+    if (mcversion >= MC_1_9)
+    {
+        distance = (4.0 * 32.0) + (nextDouble(&rnds) - 0.5) * 32 * 2.5;
+        p[0].x = (int)round(acos * distance);
+        p[0].z = (int)round(asin * distance);
+        // rotate 120 degrees
+        tmp = acos;
+        acos = tmp * r120c - asin * r120s;
+        asin = tmp * r120s + asin * r120c;
+        distance = (4.0 * 32.0) + (nextDouble(&rnds) - 0.5) * 32 * 2.5;
+        p[1].x = (int)round(acos * distance);
+        p[1].z = (int)round(asin * distance);
+        // rotate 120 degrees
+        tmp = acos;
+        acos = tmp * r120c - asin * r120s;
+        asin = tmp * r120s + asin * r120c;
+        distance = (4.0 * 32.0) + (nextDouble(&rnds) - 0.5) * 32 * 2.5;
+        p[2].x = (int)round(acos * distance);
+        p[2].z = (int)round(asin * distance);
+    }
+    else
+    {
+        distance = (1.25 + nextDouble(&rnds)) * 32.0;
+        p[0].x = (int)round(acos * distance);
+        p[0].z = (int)round(asin * distance);
+        // rotate 120 degrees
+        tmp = acos;
+        acos = tmp * r120c - asin * r120s;
+        asin = tmp * r120s + asin * r120c;
+        distance = (1.25 + nextDouble(&rnds)) * 32.0;
+        p[1].x = (int)round(acos * distance);
+        p[1].z = (int)round(asin * distance);
+        // rotate 120 degrees
+        tmp = acos;
+        acos = tmp * r120c - asin * r120s;
+        asin = tmp * r120s + asin * r120c;
+        distance = (1.25 + nextDouble(&rnds)) * 32.0;
+        p[2].x = (int)round(acos * distance);
+        p[2].z = (int)round(asin * distance);
+    }
+}
+
 const char* getValidStrongholdBiomes()
 {
     static char validStrongholdBiomes[256];
@@ -797,76 +701,6 @@ const char* getValidStrongholdBiomes()
     return validStrongholdBiomes;
 }
 
-Pos initFirstStronghold(StrongholdIter *sh, int mc, int64_t s48)
-{
-    double dist, angle;
-    int64_t rnds;
-    Pos p;
-
-    rnds = s48;
-    setSeed(&rnds);
-
-    angle = 2.0 * PI * nextDouble(&rnds);
-    if (mc >= MC_1_9)
-        dist = (4.0 * 32.0) + (nextDouble(&rnds) - 0.5) * 32 * 2.5;
-    else
-        dist = (1.25 + nextDouble(&rnds)) * 32.0;
-
-    p.x = ((int)round(cos(angle) * dist) << 4) + 8;
-    p.z = ((int)round(sin(angle) * dist) << 4) + 8;
-
-    if (sh)
-    {
-        sh->pos.x = sh->pos.z = 0;
-        sh->nextapprox = p;
-        sh->index = 0;
-        sh->ringnum = 0;
-        sh->ringmax = 3;
-        sh->ringidx = 0;
-        sh->angle = angle;
-        sh->dist = dist;
-        sh->rnds = rnds;
-        sh->mc = mc;
-    }
-
-    return p;
-}
-
-int nextStronghold(StrongholdIter *sh, const LayerStack *g, int *cache)
-{
-    sh->pos = findBiomePosition(sh->mc, &g->layers[L_RIVER_MIX_4], cache,
-        sh->nextapprox.x, sh->nextapprox.z, 112, getValidStrongholdBiomes(),
-        &sh->rnds, NULL);
-
-    sh->ringidx++;
-    sh->angle += 2 * PI / sh->ringmax;
-
-    if (sh->ringidx == sh->ringmax)
-    {
-        sh->ringnum++;
-        sh->ringidx = 0;
-        sh->ringmax = sh->ringmax + 2*sh->ringmax / (sh->ringnum+1);
-        if (sh->ringmax > 128-sh->index)
-            sh->ringmax = 128-sh->index;
-        sh->angle += nextDouble(&sh->rnds) * PI * 2.0;
-    }
-
-    if (sh->mc >= MC_1_9)
-    {
-        sh->dist = (4.0 * 32.0) + (6.0 * sh->ringnum * 32.0) +
-            (nextDouble(&sh->rnds) - 0.5) * 32 * 2.5;
-    }
-    else
-    {
-        sh->dist = (1.25 + nextDouble(&sh->rnds)) * 32.0;
-    }
-
-    sh->nextapprox.x = ((int)round(cos(sh->angle) * sh->dist) << 4) + 8;
-    sh->nextapprox.z = ((int)round(sin(sh->angle) * sh->dist) << 4) + 8;
-    sh->index++;
-
-    return (sh->mc >= MC_1_9 ? 128 : 3) - (sh->index-1);
-}
 
 int findStrongholds(const int mcversion, const LayerStack *g, int *cache,
         Pos *locations, int64_t worldSeed, int maxSH, int maxRing)
@@ -946,7 +780,6 @@ int findStrongholds(const int mcversion, const LayerStack *g, int *cache,
 
 static double getGrassProbability(int64_t seed, int biome, int x, int z)
 {
-    (void) seed, (void) biome, (void) x, (void) z;
     // TODO: Use ChunkGeneratorOverworld.generateHeightmap for better estimate.
     // TODO: Try to determine the actual probabilities and build a statistic.
     switch (biome)
@@ -955,11 +788,9 @@ static double getGrassProbability(int64_t seed, int biome, int x, int z)
     case mountains:                     return 0.8; // height dependent
     case forest:                        return 1.0;
     case taiga:                         return 1.0;
-    case swamp:                         return 0.3; // height dependent
-    case river:                         return 0.15;
-    case beach:                         return 0.0;
-    case snowy_tundra:                  return 0.02;
-    case snowy_mountains:               return 0.02;
+    case swamp:                         return 0.6; // height dependent
+    case river:                         return 0.5;
+    case beach:                         return 0.1;
     case wooded_hills:                  return 1.0;
     case taiga_hills:                   return 1.0;
     case mountain_edge:                 return 1.0; // height dependent
@@ -969,15 +800,15 @@ static double getGrassProbability(int64_t seed, int biome, int x, int z)
     case birch_forest:                  return 1.0;
     case birch_forest_hills:            return 1.0;
     case dark_forest:                   return 0.9;
-    case snowy_taiga:                   return 0.1; // below trees
-    case snowy_taiga_hills:             return 0.1; // below trees
+    case snowy_taiga:                   return 0.2; // below trees
+    case snowy_taiga_hills:             return 0.2; // below trees
     case giant_tree_taiga:              return 0.6;
     case giant_tree_taiga_hills:        return 0.6;
     case wooded_mountains:              return 0.2; // height dependent
     case savanna:                       return 1.0;
-    case savanna_plateau:               return 0.9;
-    case wooded_badlands_plateau:       return 0.0; // height dependent
-    case badlands_plateau:              return 0.0; // height dependent
+    case savanna_plateau:               return 1.0;
+    case wooded_badlands_plateau:       return 0.1; // height dependent
+    case badlands_plateau:              return 0.1; // height dependent
 
     case sunflower_plains:              return 1.0;
     case gravelly_mountains:            return 0.2;
@@ -989,7 +820,7 @@ static double getGrassProbability(int64_t seed, int biome, int x, int z)
     case tall_birch_forest:             return 1.0;
     case tall_birch_hills:              return 1.0;
     case dark_forest_hills:             return 0.9;
-    case snowy_taiga_mountains:         return 0.1;
+    case snowy_taiga_mountains:         return 0.2;
     case giant_spruce_taiga:            return 0.6;
     case giant_spruce_taiga_hills:      return 0.6;
     case modified_gravelly_mountains:   return 0.2;
@@ -1001,6 +832,12 @@ static double getGrassProbability(int64_t seed, int biome, int x, int z)
     // completely in ocean variants...
     default: return 0;
     }
+}
+
+static int canCoordinateBeSpawn(const int64_t seed, const LayerStack *g, int *cache, Pos pos)
+{
+    int biome = getBiomeAtPos(g, pos);
+    return getGrassProbability(seed, biome, pos.x, pos.z) >= 0.5;
 }
 
 
@@ -1037,14 +874,9 @@ Pos getSpawn(const int mcversion, const LayerStack *g, int *cache, int64_t world
         spawn.x = spawn.z = 8;
     }
 
-    double accum = 1;
-    double bx = 0;
-    double bz = 0;
-    double bn = 0;
-
     if (mcversion >= MC_1_13)
     {
-        int *area = allocCache(g->entry_1, 16, 16);
+        // TODO: The 1.13 section may need further checking!
         int n2 = 0;
         int n3 = 0;
         int n4 = 0;
@@ -1056,32 +888,16 @@ Pos getSpawn(const int mcversion, const LayerStack *g, int *cache, int64_t world
             {
                 int cx = ((spawn.x >> 4) + n2) << 4;
                 int cz = ((spawn.z >> 4) + n3) << 4;
-                int x, z;
+                int i2, i3;
 
-                genArea(g->entry_1, area, cx, cz, 16, 16);
-
-                for (x = 0; x < 16; x++)
+                for (i2 = cx; i2 <= cx+15; i2++)
                 {
-                    for (z = 0; z < 16; z++)
+                    for (i3 = cz; i3 <= cz+15; i3++)
                     {
-                        Pos pos = {cx+x, cz+z};
-                        int biome = area[z*16 + x];
-                        double gp = getGrassProbability(worldSeed, biome,
-                            pos.x, pos.z);
-                        if (gp == 0)
-                            continue;
-
-                        bx += accum * gp * pos.x;
-                        bz += accum * gp * pos.z;
-                        bn += accum * gp;
-
-                        accum *= 1 - gp;
-                        if (accum < 0.001)
+                        Pos pos = {i2, i3};
+                        if (canCoordinateBeSpawn(worldSeed, g, cache, pos))
                         {
-                            free(area);
-                            spawn.x = (int) round(bx / bn);
-                            spawn.z = (int) round(bz / bn);
-                            return spawn;
+                            return pos;
                         }
                     }
                 }
@@ -1090,34 +906,17 @@ Pos getSpawn(const int mcversion, const LayerStack *g, int *cache, int64_t world
             if (n2 == n3 || (n2 < 0 && n2 == - n3) || (n2 > 0 && n2 == 1 - n3))
             {
                 int n7 = n4;
-                n4 = -n5;
+                n4 = - n5;
                 n5 = n7;
             }
             n2 += n4;
             n3 += n5;
         }
-
-        free(area);
     }
     else
     {
-        for (i = 0; i < 1000; i++)
+        for (i = 0; i < 1000 && !canCoordinateBeSpawn(worldSeed, g, cache, spawn); i++)
         {
-            int biome = getBiomeAtPos(g, spawn);
-            double gp = getGrassProbability(worldSeed, biome, spawn.x, spawn.z);
-
-            bx += accum * gp * spawn.x;
-            bz += accum * gp * spawn.z;
-            bn += accum * gp;
-
-            accum *= 1 - gp;
-            if (accum < 0.001)
-            {
-                spawn.x = (int) round(bx / bn);
-                spawn.z = (int) round(bz / bn);
-                break;
-            }
-
             spawn.x += nextInt(&worldSeed, 64) - nextInt(&worldSeed, 64);
             spawn.z += nextInt(&worldSeed, 64) - nextInt(&worldSeed, 64);
         }
@@ -1142,12 +941,6 @@ Pos estimateSpawn(const int mcversion, const LayerStack *g, int *cache, int64_t 
     if (!found)
     {
         spawn.x = spawn.z = 8;
-    }
-
-    if (mcversion >= MC_1_13)
-    {
-        spawn.x = (spawn.x >> 4) << 4;
-        spawn.z = (spawn.z >> 4) << 4;
     }
 
     return spawn;
@@ -1341,6 +1134,7 @@ static int mapViableShore(const Layer * l, int * out, int x, int z, int w, int h
 int isViableStructurePos(int structureType, int mcversion, LayerStack *g,
         int64_t seed, int blockX, int blockZ)
 {
+    int regionx, regionz;
     int *map = NULL;
     Layer *l;
     int biome;
@@ -1499,6 +1293,31 @@ int isViableStructurePos(int structureType, int mcversion, LayerStack *g,
     case Ruined_Portal:
         goto L_VIABLE;
 
+    case Bastion:
+    case Fortress:
+        regionx = blockX/432;
+        regionz = blockZ/432;
+        if(blockX < 0) 
+            --regionx;
+        if(blockZ < 0) 
+            --regionz;
+
+        // set seed
+        seed = seed + regionx*341873128712 + regionz*132897987541 + BASTION_CONFIG.salt;
+        setSeed(&seed);
+        next(&seed, 31);
+        next(&seed, 31);
+        int roll = nextInt(&seed, 5);
+        if(roll >= 2)
+        {
+            if(structureType == Bastion)
+                goto L_VIABLE;
+            goto L_NOT_VIABLE;
+        }
+        if(structureType == Fortress)
+            goto L_VIABLE;
+        goto L_NOT_VIABLE;
+
     default:
         fprintf(stderr, "ERR isViableStructurePos: validation for structure type not implemented");
         goto L_NOT_VIABLE;
@@ -1603,7 +1422,6 @@ BiomeFilter setupBiomeFilter(const int *biomeList, int listLen)
         case mushroom_fields:
             // mushroom shores can generate with hills and at rivers
             bf.raresToFind |= (1ULL << mushroom_fields);
-            // fall through
         case mushroom_field_shore:
             bf.tempsToFind |= (1ULL << Oceanic);
             bf.majorToFind |= (1ULL << mushroom_fields);
@@ -1762,7 +1580,6 @@ BiomeFilter setupBiomeFilter(const int *biomeList, int listLen)
 
         case snowy_beach:
             bf.tempsToFind |= (1ULL << Freezing);
-            // fall through
         case beach:
         case stone_shore:
             bf.riverToFind |= (1ULL << id);
@@ -1770,14 +1587,12 @@ BiomeFilter setupBiomeFilter(const int *biomeList, int listLen)
 
         case mountains:
             bf.majorToFind |= (1ULL << mountains);
-            // fall through
         case wooded_mountains:
             bf.raresToFind |= (1ULL << id);
             bf.riverToFind |= (1ULL << id);
             break;
         case gravelly_mountains:
             bf.majorToFind |= (1ULL << mountains);
-            // fall through
         case modified_gravelly_mountains:
             bf.raresToFindM |= (1ULL << (id-128));
             bf.riverToFindM |= (1ULL << (id-128));
@@ -2149,8 +1964,8 @@ int checkForBiomes(
             l = &g->layers[L_SPECIAL_1024];
             x0 = (bx) / l->scale; if (x < 0) x0--;
             z0 = (bz) / l->scale; if (z < 0) z0--;
-            x1 = (bx + bw) / l->scale; if (x+(int)w >= 0) x1++;
-            z1 = (bz + bh) / l->scale; if (z+(int)h >= 0) z1++;
+            x1 = (bx + bw) / l->scale; if (x+w >= 0) x1++;
+            z1 = (bz + bh) / l->scale; if (z+h >= 0) z1++;
             ss = getStartSeed(seed, l->layerSeed);
 
             for (j = z0; j <= z1; j++)
@@ -2169,8 +1984,8 @@ int checkForBiomes(
         l = &g->layers[L_BIOME_256];
         x0 = bx / l->scale; if (x < 0) x0--;
         z0 = bz / l->scale; if (z < 0) z0--;
-        x1 = (bx + bw) / l->scale; if (x+(int)w >= 0) x1++;
-        z1 = (bz + bh) / l->scale; if (z+(int)h >= 0) z1++;
+        x1 = (bx + bw) / l->scale; if (x+w >= 0) x1++;
+        z1 = (bz + bh) / l->scale; if (z+h >= 0) z1++;
 
         if (filter.majorToFind & (1ULL << mushroom_fields))
         {
